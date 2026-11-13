@@ -72,7 +72,8 @@ fn run(cmd: Command<'_>) -> io::Result<ExitCode> {
             let mut listener = Listener::bind(resolve(local)?)?;
             #[cfg(feature = "forward")]
             if let Some(upstream) = forward {
-                listener = listener.forward_to(resolve(upstream)?)?;
+                listener =
+                    listener.forward_to(resolve(upstream)?, udepe::proxy::DEFAULT_IDLE_TIMEOUT);
             }
             // `run` only returns on failure: its success type is uninhabited.
             let Err(err) = listener.run(&mut io::stdout().lock());

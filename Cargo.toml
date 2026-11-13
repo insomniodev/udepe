@@ -13,6 +13,8 @@ forward = []
 
 [dependencies]
 log = "0.4.34"
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+quinn-udp = { version = "0.6.3", default-features = false }
 socket2 = "0.6.5"
 
 [lints.rust]

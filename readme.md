@@ -21,9 +21,20 @@ Received datagrams go to stdout as `<from>: <data>`; status goes to stderr.
 | `src/main.rs`   | Binary boundary: args, logger, address resolution, exit codes |
 | `src/cli.rs`    | Pure, zero-copy argument parsing                             |
 | `src/udp.rs`    | Socket policy: dual-stack bind, ephemeral senders            |
-| `src/listen.rs` | `Listener`: receive, print, optionally relay                 |
-| `src/proxy.rs`  | `Proxy`: one upstream socket and reply thread per client     |
+| `src/batch.rs`  | I/O seam: non-blocking sockets, batched receive and send     |
+| `src/listen.rs` | `Listener`: the event loop; receive, print, optionally relay |
+| `src/proxy.rs`  | `Proxy`: session table, one upstream socket per client       |
 | `tests/cli.rs`  | End-to-end tests against the built binary                    |
+
+## I/O model
+
+No async runtime. `Listener` is a single-threaded event loop on `mio`
+(epoll on Linux); `quinn-udp` batches the system calls underneath
+(`recvmmsg`, GRO on receive, GSO on send). Sessions are rows in a table owned
+by the loop, so nothing is locked or shared between threads.
+
+Datagrams are never fragmented: one larger than the path MTU is dropped.
+When a send buffer is full, datagrams are dropped rather than queued.
 
 ## Features
 

@@ -1,274 +1,205 @@
 //! Bidirectional UDP relay. Each client gets a session with its own upstream
-//! socket and reply thread, so replies from upstream can be routed back to the
-//! client that caused them.
+//! socket, so replies from upstream can be routed back to the client that
+//! caused them.
+//!
+//! A `Proxy` is single-threaded state driven by its owner's event loop: it
+//! registers the session sockets with that loop's [`Registry`] and is told
+//! when one becomes readable. Nothing here blocks or locks.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::{self, JoinHandle};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use log::{info, warn};
+use log::{debug, info, warn};
+use mio::{Interest, Registry, Token};
 
+use crate::batch::{RecvBatch, Socket};
 use crate::udp::{self, canonical};
 
 /// How long a session may go without traffic in either direction before it
 /// is closed, unless the caller picks otherwise.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Keep socket timeouts nonzero, even near the idle deadline.
-const MIN_READ_TIMEOUT: Duration = Duration::from_millis(1);
+/// Idle sessions are swept this many times per idle timeout, so a session
+/// outlives its timeout by at most that fraction.
+const SWEEPS_PER_TIMEOUT: u32 = 4;
+
+/// Keeps the sweep from spinning when the idle timeout is tiny.
+const MIN_SWEEP_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Relays datagrams to one upstream address and replies back to their senders.
-/// Dropping it closes all sessions and joins their threads.
 pub struct Proxy {
-    shared: Arc<Shared>,
-    workers: Vec<JoinHandle<()>>,
-}
-
-/// State shared with the reply threads.
-struct Shared {
-    /// Socket clients send to. Replies go out through it as well, so clients
-    /// see them coming from the address they sent to.
-    downstream: UdpSocket,
     upstream: SocketAddr,
     idle_timeout: Duration,
-    sessions: Mutex<HashMap<SocketAddr, Session>>,
-    shutdown: AtomicBool,
+    /// Session slot for each client.
+    clients: HashMap<SocketAddr, usize>,
+    /// Sessions by slot, which is also what their [`Token`] is derived from.
+    sessions: Vec<Option<Session>>,
+    /// Empty slots in `sessions`, reused before it grows.
+    free: Vec<usize>,
+    first_token: usize,
+    next_sweep: Instant,
 }
 
 struct Session {
-    sock: Arc<UdpSocket>,
+    client: SocketAddr,
+    sock: Socket,
     last_active: Instant,
 }
 
 impl Proxy {
-    /// Creates a proxy that replies through `downstream` and closes sessions
-    /// after `idle_timeout` without traffic.
+    /// Creates a proxy for `upstream` that closes sessions after
+    /// `idle_timeout` without traffic. Its sessions use tokens from
+    /// `first_token` upwards; the owner keeps the ones below.
     #[must_use]
-    pub fn new(downstream: UdpSocket, upstream: SocketAddr, idle_timeout: Duration) -> Self {
-        let shared = Shared {
-            downstream,
+    pub fn new(upstream: SocketAddr, idle_timeout: Duration, first_token: Token) -> Self {
+        Self {
             upstream,
             idle_timeout,
-            sessions: Mutex::default(),
-            shutdown: AtomicBool::new(false),
-        };
-        Self {
-            shared: Arc::new(shared),
-            workers: Vec::new(),
+            clients: HashMap::new(),
+            sessions: Vec::new(),
+            free: Vec::new(),
+            first_token: first_token.0,
+            next_sweep: Instant::now(),
         }
     }
 
-    /// Relays `data` from `client` upstream, opening a session if needed.
+    /// Relays `data` from `client` upstream as datagrams of `stride` bytes,
+    /// opening a session if needed.
     ///
     /// # Errors
     ///
     /// Fails if a new session cannot be set up or the send fails.
-    pub fn forward(&mut self, client: SocketAddr, data: &[u8]) -> io::Result<()> {
-        self.workers.retain(|w| !w.is_finished());
-        let sock = {
-            let mut sessions = self.shared.sessions();
-            let session = match sessions.entry(client) {
-                Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(e) => {
-                    let sock = Arc::new(udp::socket_for(self.shared.upstream)?);
-                    let local = sock.local_addr()?;
-                    let worker = Shared::spawn_relay(&self.shared, client, Arc::clone(&sock))?;
-                    self.workers.push(worker);
-                    info!("session {} opened via {local}", canonical(client));
-                    e.insert(Session {
-                        sock,
-                        last_active: Instant::now(),
-                    })
-                }
-            };
-            session.last_active = Instant::now();
-            Arc::clone(&session.sock)
-        };
-        sock.send_to(data, self.shared.upstream).map(drop)
-    }
-
-    /// Returns the number of open sessions.
-    #[must_use]
-    pub fn session_count(&self) -> usize {
-        self.shared.sessions().len()
-    }
-}
-
-impl Drop for Proxy {
-    fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Relaxed);
-        for session in self.shared.sessions().values() {
-            if let Ok(mut local) = session.sock.local_addr() {
-                local.set_ip(match local {
-                    SocketAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
-                    SocketAddr::V6(_) => Ipv6Addr::LOCALHOST.into(),
-                });
-                // A separate socket covers mismatched downstream/upstream families.
-                if let Err(err) = self
-                    .shared
-                    .downstream
-                    .send_to(&[], local)
-                    .or_else(|_| udp::send(local, &[]))
-                {
-                    warn!("session {local}: wake failed: {err}");
-                }
-            }
-        }
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
-    }
-}
-
-impl Shared {
-    fn spawn_relay(
-        self: &Arc<Self>,
+    pub fn forward(
+        &mut self,
+        registry: &Registry,
         client: SocketAddr,
-        sock: Arc<UdpSocket>,
-    ) -> io::Result<JoinHandle<()>> {
-        let shared = Arc::clone(self);
-        thread::Builder::new()
-            .name(format!("session {}", canonical(client)))
-            .spawn(move || shared.relay_replies(client, &sock))
+        data: &[u8],
+        stride: usize,
+        now: Instant,
+    ) -> io::Result<()> {
+        let slot = match self.clients.get(&client) {
+            Some(&slot) => slot,
+            None => self.open(registry, client, now)?,
+        };
+        let Some(session) = &mut self.sessions[slot] else {
+            return Err(io::Error::other("session table out of sync"));
+        };
+        session.last_active = now;
+        session.sock.send(self.upstream, data, stride)
     }
 
-    /// Locks the session table. Every critical section leaves it consistent,
-    /// so a panic elsewhere does not invalidate it.
-    fn sessions(&self) -> MutexGuard<'_, HashMap<SocketAddr, Session>> {
-        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Relays datagrams from upstream back to `client` until the session goes
-    /// idle, receiving fails or the proxy shuts down.
-    fn relay_replies(&self, client: SocketAddr, sock: &UdpSocket) {
-        let mut buf = vec![0; udp::MAX_DATAGRAM];
+    /// Relays everything queued on the session behind `token` back to its
+    /// client through `front`, so the client sees replies coming from the
+    /// address it sent to. Tokens of closed sessions are ignored.
+    pub fn relay_replies(
+        &mut self,
+        token: Token,
+        front: &Socket,
+        batch: &mut RecvBatch,
+        now: Instant,
+    ) {
+        let Some(session) = token
+            .0
+            .checked_sub(self.first_token)
+            .and_then(|slot| self.sessions.get_mut(slot))
+            .and_then(Option::as_mut)
+        else {
+            return;
+        };
+        let client = session.client;
         loop {
-            if self.shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            let left = self.expire_if_idle(client);
-            if left.is_zero() {
-                break;
-            }
-            if let Err(err) = sock.set_read_timeout(Some(left.max(MIN_READ_TIMEOUT))) {
-                warn!("session {}: timeout setup failed: {err}", canonical(client));
-                break;
-            }
-            let received = sock.recv_from(&mut buf);
-            if self.shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            match received {
-                Ok((n, from)) if from == self.upstream => {
-                    self.touch(client);
-                    if let Err(err) = self.downstream.send_to(&buf[..n], client) {
-                        warn!("session {}: reply failed: {err}", canonical(client));
-                    }
+            match session.sock.recv(batch) {
+                Ok(true) => {}
+                Ok(false) => break,
+                // An ICMP error for an earlier send; the queue may hold more.
+                Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+                    warn!("session {}: upstream unreachable", canonical(client));
+                    continue;
                 }
-                Ok(_) => {}
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::WouldBlock
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::Interrupted
-                    ) => {}
                 Err(err) => {
                     warn!("session {}: receive failed: {err}", canonical(client));
                     break;
                 }
             }
-        }
-        let mut sessions = self.sessions();
-        if sessions
-            .get(&client)
-            .is_some_and(|session| std::ptr::eq(session.sock.as_ref(), sock))
-        {
-            sessions.remove(&client);
-        }
-        drop(sessions);
-        info!("session {} closed", canonical(client));
-    }
-
-    fn touch(&self, client: SocketAddr) {
-        if let Some(s) = self.sessions().get_mut(&client) {
-            s.last_active = Instant::now();
-        }
-    }
-
-    /// Returns how long the session may still go without traffic, removing it
-    /// once that is zero. Checking and removing under one lock keeps `forward`
-    /// from reusing a session that is about to close.
-    fn expire_if_idle(&self, client: SocketAddr) -> Duration {
-        let mut sessions = self.sessions();
-        let left = sessions.get(&client).map_or(Duration::ZERO, |s| {
-            self.idle_timeout.saturating_sub(s.last_active.elapsed())
-        });
-        if left.is_zero() {
-            sessions.remove(&client);
-        }
-        left
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn localhost() -> io::Result<UdpSocket> {
-        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-    }
-
-    #[test]
-    fn drop_wakes_sessions_with_long_idle_timeouts() -> io::Result<()> {
-        for upstream in [localhost()?, UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))?] {
-            let mut proxy = Proxy::new(
-                localhost()?,
-                upstream.local_addr()?,
-                Duration::from_secs(60),
-            );
-            let clients = [localhost()?, localhost()?];
-            for client in &clients {
-                proxy.forward(client.local_addr()?, b"hello")?;
+            for reply in batch.iter() {
+                session.last_active = now;
+                match front.send(client, reply.data, reply.stride) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        debug!("session {}: reply dropped", canonical(client));
+                    }
+                    Err(err) => warn!("session {}: reply failed: {err}", canonical(client)),
+                }
             }
-            assert_eq!(proxy.session_count(), clients.len());
-            thread::sleep(Duration::from_millis(20));
-
-            let start = Instant::now();
-            drop(proxy);
-            assert!(start.elapsed() < Duration::from_secs(1));
         }
-        Ok(())
     }
 
-    #[test]
-    fn replies_reach_the_original_client() -> io::Result<()> {
-        let (front, upstream) = (localhost()?, localhost()?);
-        let front_addr = front.local_addr()?;
-        let mut proxy = Proxy::new(front, upstream.local_addr()?, Duration::from_millis(50));
-
-        let mut buf = [0; 16];
-        for data in [b"one", b"two"] {
-            let client = localhost()?;
-            proxy.forward(client.local_addr()?, data)?;
-
-            let (n, from) = upstream.recv_from(&mut buf)?;
-            assert_eq!(&buf[..n], data);
-            upstream.send_to(&buf[..n], from)?;
-
-            let (n, from) = client.recv_from(&mut buf)?;
-            assert_eq!(&buf[..n], data);
-            assert_eq!(from, front_addr);
+    /// Closes the sessions that have been idle for too long. Cheap to call
+    /// on every turn of the loop: it only scans once per sweep interval.
+    pub fn expire(&mut self, registry: &Registry, now: Instant) {
+        if self.clients.is_empty() || now < self.next_sweep {
+            return;
         }
-        assert_eq!(proxy.session_count(), 2);
+        self.next_sweep = now + self.sweep_interval();
+        for slot in 0..self.sessions.len() {
+            let idle = self.sessions[slot]
+                .as_ref()
+                .is_some_and(|s| now.duration_since(s.last_active) >= self.idle_timeout);
+            if idle && let Some(mut session) = self.sessions[slot].take() {
+                self.clients.remove(&session.client);
+                self.free.push(slot);
+                // Closing the socket deregisters it too; this only makes it explicit.
+                let _ = registry.deregister(session.sock.source());
+                info!("session {} closed", canonical(session.client));
+            }
+        }
+    }
 
-        thread::sleep(Duration::from_millis(200));
-        assert_eq!(proxy.session_count(), 0);
-        Ok(())
+    /// Returns how long the owner may wait for events before it must call
+    /// [`Proxy::expire`] again, or `None` while there are no sessions.
+    #[must_use]
+    pub fn timeout(&self, now: Instant) -> Option<Duration> {
+        (!self.clients.is_empty()).then(|| self.next_sweep.saturating_duration_since(now))
+    }
+
+    /// Returns the number of open sessions.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    fn sweep_interval(&self) -> Duration {
+        (self.idle_timeout / SWEEPS_PER_TIMEOUT).max(MIN_SWEEP_INTERVAL)
+    }
+
+    /// Opens a session for `client` and returns its slot.
+    fn open(&mut self, registry: &Registry, client: SocketAddr, now: Instant) -> io::Result<usize> {
+        let mut sock = Socket::new(udp::socket_for(self.upstream)?)?;
+        // Connecting lets the kernel drop datagrams from anyone but upstream.
+        sock.connect(self.upstream)?;
+        let local = sock.local_addr()?;
+
+        let slot = self.free.last().copied().unwrap_or(self.sessions.len());
+        let token = Token(self.first_token + slot);
+        registry.register(sock.source(), token, Interest::READABLE)?;
+
+        let session = Some(Session {
+            client,
+            sock,
+            last_active: now,
+        });
+        if self.free.pop().is_some() {
+            self.sessions[slot] = session;
+        } else {
+            self.sessions.push(session);
+        }
+        if self.clients.is_empty() {
+            self.next_sweep = now + self.sweep_interval();
+        }
+        self.clients.insert(client, slot);
+        info!("session {} opened via {local}", canonical(client));
+        Ok(slot)
     }
 }
