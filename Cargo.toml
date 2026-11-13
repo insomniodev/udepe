@@ -1,0 +1,28 @@
+[package]
+name = "udepe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Minimal UDP sender, listener and session-tracking relay"
+publish = false
+
+[features]
+default = ["forward"]
+# `listen --forward`: relay datagrams upstream with per-client sessions.
+forward = []
+
+[dependencies]
+log = "0.4.34"
+socket2 = "0.6.5"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = true
+strip = true
